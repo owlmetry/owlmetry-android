@@ -9,5 +9,5 @@ package com.owlmetry.android
  */
 public object OwlmetryVersion {
     public const val NAME: String = "owlmetry-android"
-    public const val CURRENT: String = "0.1.1"
+    public const val CURRENT: String = "0.1.0"
 }

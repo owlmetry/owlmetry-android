@@ -73,20 +73,27 @@ jobs:
           echo "next=$next" >> "$GITHUB_OUTPUT"
           echo "Next version: $next (from '$msg')"
 
-      - name: Bump SDK version constant
+      - name: Bump SDK version (runtime constant + Maven coordinate)
         env:
           NEXT: ${{ steps.ver.outputs.next }}
         run: |
-          # Strip leading "v" — OwlmetryVersion.CURRENT is plain semver.
+          # Strip leading "v" — both are plain semver.
           version="${NEXT#v}"
-          file="owlmetry-android/src/main/kotlin/com/owlmetry/android/OwlmetryVersion.kt"
-          sed -i -E "s/(public const val CURRENT: String = )\"[^\"]*\"/\1\"$version\"/" "$file"
-          if git diff --quiet "$file"; then
-            echo "OwlmetryVersion.CURRENT already at $version — no change."
+          kt="owlmetry-android/src/main/kotlin/com/owlmetry/android/OwlmetryVersion.kt"
+          props="gradle.properties"
+          # Runtime SDK-version constant stamped on every event.
+          sed -i -E "s/(public const val CURRENT: String = )\"[^\"]*\"/\1\"$version\"/" "$kt"
+          # VERSION_NAME is the PUBLISHED Maven coordinate (mavenPublishing reads
+          # it). It MUST bump in lockstep with the tag — otherwise every release
+          # after the first re-publishes the same version and Central rejects the
+          # duplicate, silently breaking the pipeline.
+          sed -i -E "s/^(VERSION_NAME=).*/\1$version/" "$props"
+          if git diff --quiet "$kt" "$props"; then
+            echo "Version already at $version — no change."
           else
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add "$file"
+            git add "$kt" "$props"
             git commit -m "chore: bump SDK version to $version [skip ci]"
             git push origin HEAD:main
           fi
