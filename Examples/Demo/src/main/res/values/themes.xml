@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- A bare Material3 base theme. The Compose UI supplies its own colors via
+         MaterialTheme; this only needs to be a valid Material3 host theme so the
+         Activity window and (non-Compose) system chrome render correctly. -->
+    <style name="Theme.OwlmetryDemo" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>
