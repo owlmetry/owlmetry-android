@@ -13,6 +13,8 @@ androidxTestCore = "1.6.1"
 androidxTestExt = "1.2.1"
 androidxTestRunner = "1.6.2"
 espresso = "3.6.1"
+# publishing (build-time Gradle plugin only — NOT a runtime dependency)
+vanniktechMavenPublish = "0.30.0"
 
 [libraries]
 # Core (the one sanctioned runtime dependency — mirrors Swift Concurrency)
@@ -48,3 +50,5 @@ android-library = { id = "com.android.library", version.ref = "agp" }
 android-application = { id = "com.android.application", version.ref = "agp" }
 kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
 kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+# Maven Central / Sonatype Central Portal publishing (signing + sources/javadoc jars)
+vanniktech-maven-publish = { id = "com.vanniktech.maven.publish", version.ref = "vanniktechMavenPublish" }

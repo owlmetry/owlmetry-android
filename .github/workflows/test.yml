@@ -1,0 +1,60 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+  repository_dispatch:
+    types: [monorepo-updated]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Lint + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # The Android Gradle Plugin needs a JDK; AGP 8.7 supports running on
+      # JDK 17–21. We use 21 (the toolchain the runner is happiest on) while the
+      # modules still compile Kotlin/Java to a 17 target via compileOptions —
+      # the build JDK and the bytecode target are independent.
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # The ubuntu-latest image ships a preinstalled Android SDK (ANDROID_HOME
+      # / ANDROID_SDK_ROOT already exported), but this action makes the
+      # required platform + build-tools explicit, accepts licenses, and pins a
+      # cmdline-tools version so the build never blocks on a license prompt.
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      # Caches ~/.gradle/caches + ~/.gradle/wrapper and the per-module build
+      # caches, and wires up the read/write split so only main-branch builds
+      # populate the shared cache.
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Show Gradle + Java versions
+        run: ./gradlew --version
+
+      # Pure Robolectric / JVM unit tests — no Postgres, no running server
+      # (unlike the Swift SDK's integration suite). `lint` covers AGP's Android
+      # lint across both library modules; `test` runs the JVM unit tests.
+      - name: Lint and unit tests
+        run: ./gradlew lint test --stacktrace
+
+      - name: Upload test + lint reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: reports
+          path: |
+            **/build/reports/tests/
+            **/build/reports/lint-results-*.html
+          if-no-files-found: ignore

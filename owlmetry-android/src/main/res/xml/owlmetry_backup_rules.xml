@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Auto Backup rules for the legacy `android:fullBackupContent` attribute
+  (Android 6.0–11 / API 23–30).
+
+  The Owlmetry SDK keeps its persistent identity in a private SharedPreferences
+  file named `com.owlmetry.sdk` (see IdentityStore). That file holds the
+  anonymous id (`owl_anon_*`) and, once `Owl.setUser` is called, the real user
+  id. On iOS the anonymous id lives in the Keychain, so it survives an app
+  delete + reinstall; Android has no framework-only equivalent and wipes a
+  package's SharedPreferences on uninstall.
+
+  Including the prefs file in Auto Backup is the best-effort Android analog: it
+  lets the anonymous id roam to a fresh install via Google's cloud backup, so a
+  returning user keeps a stable identity instead of being minted a brand-new
+  anonymous row. It is best-effort by design — Auto Backup is opportunistic
+  (Wi-Fi, charging, ~24h cadence, 25 MB cap) and the user can disable it, so the
+  SDK never depends on it for correctness.
+
+  This file is shipped *by the SDK* but cannot take effect on its own — the host
+  app must reference it from its <application> tag:
+
+      android:fullBackupContent="@xml/owlmetry_backup_rules"
+
+  If the host already defines its own backup rules, merge this <include> into
+  them rather than overwriting. See README "Anonymous id persistence".
+-->
+<full-backup-content>
+    <!--
+      Back up only the SDK's identity prefs. Scoped tightly to one file so the
+      SDK's backup footprint stays minimal and never sweeps in unrelated app
+      data. The `.xml` suffix is the on-disk filename SharedPreferences writes
+      under shared_prefs/ for the `com.owlmetry.sdk` preference name.
+    -->
+    <include domain="sharedpref" path="com.owlmetry.sdk.xml" />
+</full-backup-content>

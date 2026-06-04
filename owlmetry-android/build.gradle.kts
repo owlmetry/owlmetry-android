@@ -1,7 +1,16 @@
+import com.vanniktech.maven.publish.SonatypeHost
+
 plugins {
     alias(libs.plugins.android.library)
     alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.vanniktech.maven.publish)
 }
+
+// Published coordinates. GROUP + VERSION_NAME come from gradle.properties so the
+// release workflow has a single bump target; keep VERSION_NAME in sync with
+// OwlmetryVersion.CURRENT (the runtime SDK-version constant stamped on events).
+group = providers.gradleProperty("GROUP").get()
+version = providers.gradleProperty("VERSION_NAME").get()
 
 android {
     namespace = "com.owlmetry.android"
@@ -48,4 +57,55 @@ dependencies {
     testImplementation(libs.robolectric)
     testImplementation(libs.androidx.test.core)
     testImplementation(libs.androidx.test.ext.junit)
+}
+
+// Maven Central (Sonatype Central Portal) publishing for the core artifact.
+//
+// Signing + Sonatype credentials are supplied at publish time via Gradle
+// properties / env vars — never hardcoded here. The CI release job must provide:
+//   ORG_GRADLE_PROJECT_mavenCentralUsername      — Central Portal token username
+//   ORG_GRADLE_PROJECT_mavenCentralPassword      — Central Portal token password
+//   ORG_GRADLE_PROJECT_signingInMemoryKey        — ASCII-armored GPG secret key
+//   ORG_GRADLE_PROJECT_signingInMemoryKeyPassword — GPG key passphrase
+// (set as repo secrets / actions env so they reach the `publish` task).
+mavenPublishing {
+    coordinates("com.owlmetry", "owlmetry-android", version.toString())
+
+    pom {
+        name.set("Owlmetry Android SDK")
+        description.set(
+            "Kotlin SDK for Android — event logging, metrics, funnels, identity, " +
+                "screen tracking, feedback, and questionnaires. Core module (framework + coroutines only)."
+        )
+        url.set("https://owlmetry.com/github")
+        inceptionYear.set("2026")
+
+        licenses {
+            license {
+                name.set("MIT License")
+                url.set("https://opensource.org/licenses/MIT")
+                distribution.set("repo")
+            }
+        }
+
+        developers {
+            developer {
+                id.set("owlmetry")
+                name.set("Owlmetry")
+                url.set("https://owlmetry.com")
+            }
+        }
+
+        scm {
+            url.set("https://github.com/owlmetry/owlmetry-android")
+            connection.set("scm:git:git://github.com/owlmetry/owlmetry-android.git")
+            developerConnection.set("scm:git:ssh://git@github.com/owlmetry/owlmetry-android.git")
+        }
+    }
+
+    // Sonatype Central Portal, auto-release after the upload validates.
+    publishToMavenCentral(SonatypeHost.CENTRAL_PORTAL, automaticRelease = true)
+    // Sign all publications (skipped automatically when no signing key is present,
+    // e.g. a local publishToMavenLocal smoke test).
+    signAllPublications()
 }

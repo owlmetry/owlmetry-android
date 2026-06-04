@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Data-extraction rules for the `android:dataExtractionRules` attribute
+  (Android 12+ / API 31+), which supersedes `android:fullBackupContent`.
+
+  Same intent as owlmetry_backup_rules.xml: persist the SDK's identity prefs
+  (`com.owlmetry.sdk` SharedPreferences — anonymous id + optional real user id,
+  see IdentityStore) so the anonymous id survives a reinstall best-effort. On
+  Android 12+ the framework splits backup into two channels, declared
+  separately here:
+
+    * <cloud-backup>     — Google Drive cloud backup (the reinstall path).
+    * <device-transfer>  — direct device-to-device migration when the user moves
+                           to a new phone.
+
+  Including the prefs in both means a returning user keeps a stable anonymous id
+  whether they reinstall from the cloud or transfer to a new device — the
+  closest Android gets to iOS Keychain reinstall persistence. Still best-effort:
+  cloud backup is opportunistic and user-disablable, so the SDK treats reinstall
+  survival as a bonus, not a guarantee.
+
+  Shipped by the SDK but only takes effect when the host app references it:
+
+      android:dataExtractionRules="@xml/owlmetry_data_extraction_rules"
+
+  Host apps with existing extraction rules should merge these <include> lines
+  into their own file. See README "Anonymous id persistence".
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <!-- Roams the SDK identity prefs to a reinstall via Google cloud backup. -->
+        <include domain="sharedpref" path="com.owlmetry.sdk.xml" />
+    </cloud-backup>
+    <device-transfer>
+        <!-- Carries the SDK identity prefs across a device-to-device migration. -->
+        <include domain="sharedpref" path="com.owlmetry.sdk.xml" />
+    </device-transfer>
+</data-extraction-rules>

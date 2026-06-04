@@ -1,0 +1,138 @@
+name: Auto-tag release
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'Examples/**'
+      - '**.md'
+      - '.gitignore'
+
+concurrency:
+  group: auto-tag
+  cancel-in-progress: false
+
+jobs:
+  wait-for-tests:
+    name: Wait for Test workflow
+    runs-on: ubuntu-latest
+    steps:
+      # Block the release until the Test workflow's job goes green on THIS sha,
+      # so a bad push to main can't auto-tag + publish a broken release. The
+      # regexp must match the Test workflow's job name ("Lint + unit tests").
+      - name: Wait for lint + unit tests
+        uses: lewagon/wait-on-check-action@v1.3.4
+        with:
+          ref: ${{ github.sha }}
+          check-regexp: "Lint \\+ unit tests"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          wait-interval: 20
+          allowed-conclusions: success
+
+  tag:
+    name: Bump, tag, and publish
+    needs: wait-for-tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Compute next version
+        id: ver
+        run: |
+          latest=$(git tag -l 'v*' --sort=-v:refname | head -n1)
+          current=${latest#v}
+          current=${current:-0.0.0}
+          IFS='.' read -r MAJ MIN PAT <<< "$current"
+
+          msg=$(git log -1 --pretty=%s ${{ github.sha }})
+          # feat!:/fix!:/BREAKING CHANGE → major; feat:/feat(...) → minor; else patch.
+          # Pre-1.0 semver convention: while MAJ is 0 the API is unstable, so a
+          # breaking marker bumps minor instead of jumping straight to 1.0.0.
+          # The first major release happens manually (tag v1.0.0 by hand) — this
+          # workflow only takes over once the project is past 0.x.
+          if [[ "$msg" == *"!:"* || "$msg" == *"BREAKING CHANGE"* ]]; then
+            if [[ "$MAJ" == "0" ]]; then
+              MIN=$((MIN+1)); PAT=0
+            else
+              MAJ=$((MAJ+1)); MIN=0; PAT=0
+            fi
+          elif [[ "$msg" == feat:* || "$msg" == feat\(* ]]; then
+            MIN=$((MIN+1)); PAT=0
+          else
+            PAT=$((PAT+1))
+          fi
+          # Bootstrap floor: if no tags exist yet, seed at 0.1.0.
+          if [[ -z "$latest" ]]; then MAJ=0; MIN=1; PAT=0; fi
+
+          next="v${MAJ}.${MIN}.${PAT}"
+          echo "next=$next" >> "$GITHUB_OUTPUT"
+          echo "Next version: $next (from '$msg')"
+
+      - name: Bump SDK version constant
+        env:
+          NEXT: ${{ steps.ver.outputs.next }}
+        run: |
+          # Strip leading "v" — OwlmetryVersion.CURRENT is plain semver.
+          version="${NEXT#v}"
+          file="owlmetry-android/src/main/kotlin/com/owlmetry/android/OwlmetryVersion.kt"
+          sed -i -E "s/(public const val CURRENT: String = )\"[^\"]*\"/\1\"$version\"/" "$file"
+          if git diff --quiet "$file"; then
+            echo "OwlmetryVersion.CURRENT already at $version — no change."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add "$file"
+            git commit -m "chore: bump SDK version to $version [skip ci]"
+            git push origin HEAD:main
+          fi
+
+      - name: Create tag and release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git tag "${{ steps.ver.outputs.next }}"
+          git push origin "${{ steps.ver.outputs.next }}"
+          gh release create "${{ steps.ver.outputs.next }}" \
+            --title "${{ steps.ver.outputs.next }}" \
+            --generate-notes
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # Publish both library modules to Maven Central. Uses the vanniktech
+      # maven-publish plugin's one-shot task, which stages + closes + releases
+      # to the Central Portal. Credentials + GPG key are read from the
+      # ORG_GRADLE_PROJECT_* env vars (the plugin's standard property names):
+      #   signingInMemoryKey         — ASCII-armored GPG private key
+      #   signingInMemoryKeyPassword — its passphrase
+      #   mavenCentralUsername       — Central Portal token username
+      #   mavenCentralPassword       — Central Portal token password
+      # Gated on the GPG + Sonatype secrets being present so forks / pre-config
+      # pushes tag-and-release without failing the job on a missing credential.
+      # --no-configuration-cache: the publish/signing tasks aren't
+      # configuration-cache safe, and the repo enables it by default in
+      # gradle.properties.
+      - name: Publish to Maven Central
+        if: >-
+          env.ORG_GRADLE_PROJECT_signingInMemoryKey != '' &&
+          env.ORG_GRADLE_PROJECT_mavenCentralUsername != ''
+        env:
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.ORG_GRADLE_PROJECT_signingInMemoryKey }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.ORG_GRADLE_PROJECT_signingInMemoryKeyPassword }}
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.ORG_GRADLE_PROJECT_mavenCentralUsername }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.ORG_GRADLE_PROJECT_mavenCentralPassword }}
+        run: ./gradlew publishAndReleaseToMavenCentral --no-configuration-cache --stacktrace
