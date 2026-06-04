@@ -30,6 +30,15 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+
+    testOptions {
+        unitTests {
+            // Robolectric needs the merged Android resources, and the Compose UI
+            // test harness (createComposeRule) needs them to resolve the
+            // empty-activity manifest entry from compose-ui-test-manifest.
+            isIncludeAndroidResources = true
+        }
+    }
 }
 
 dependencies {
@@ -50,6 +59,11 @@ dependencies {
     testImplementation(libs.coroutines.test)
     testImplementation(libs.robolectric)
     testImplementation(libs.androidx.test.ext.junit)
+    // Compose UI tests run under Robolectric (JVM `test/`), so the Compose test
+    // harness + the empty-activity manifest must be on the unit-test classpath.
+    testImplementation(composeBom)
+    testImplementation(libs.compose.ui.test.junit4)
+    testImplementation(libs.compose.ui.test.manifest)
 
     androidTestImplementation(composeBom)
     androidTestImplementation(libs.compose.ui.test.junit4)

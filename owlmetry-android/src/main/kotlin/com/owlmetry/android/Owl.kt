@@ -466,6 +466,124 @@ public object Owl {
         }
     }
 
+    // MARK: - Feedback
+
+    /**
+     * Submit free-text user feedback to Owlmetry. Mirrors Swift
+     * `Owl.sendFeedback`.
+     *
+     * Unlike events, feedback is **not** offline-queued — it's a one-shot,
+     * interactive submission: the caller awaits the result (a returned
+     * [OwlFeedbackReceipt]) and surfaces success/failure in its own UI. The
+     * server auto-attaches session id, user id, app version, SDK version,
+     * environment, device model, and OS version from the configured state; the
+     * caller supplies only the message and optional contact details.
+     *
+     * Whitespace is trimmed from [message]; an empty/whitespace-only message
+     * throws [OwlFeedbackError.EmptyMessage] before any network call. [name] and
+     * [email] are trimmed and dropped when blank.
+     *
+     * On success an audit event `sdk:feedback_submitted` is emitted into the
+     * normal event stream (so feedback is observable alongside other activity),
+     * tagged `has_email` / `has_name`.
+     *
+     * @throws OwlFeedbackError.NotConfigured if [configure] has not been called.
+     * @throws OwlFeedbackError.EmptyMessage if [message] is blank.
+     * @throws OwlFeedbackError.ServerError on a non-2xx response.
+     * @throws OwlFeedbackError.TransportFailure on a network/encode/decode failure.
+     */
+    public suspend fun sendFeedback(
+        message: String,
+        name: String? = null,
+        email: String? = null,
+    ): OwlFeedbackReceipt {
+        val trimmed = message.trim()
+        if (trimmed.isEmpty()) throw OwlFeedbackError.EmptyMessage
+
+        val snapshot: FeedbackSnapshot? = synchronized(lock) {
+            val s = state
+            if (s == null) {
+                if (!hasWarnedNotConfigured) {
+                    hasWarnedNotConfigured = true
+                    android.util.Log.w(
+                        ConsoleLogger.TAG,
+                        "Owl.configure() has not been called. sendFeedback dropped.",
+                    )
+                }
+                return@synchronized null
+            }
+            FeedbackSnapshot(
+                transport = s.transport,
+                bundleId = s.configuration.bundleId,
+                deviceInfo = s.deviceInfo,
+                userId = s.defaultUserId,
+                sessionId = s.sessionId,
+                isDev = s.isDev,
+            )
+        }
+
+        if (snapshot == null) throw OwlFeedbackError.NotConfigured
+        val transport = snapshot.transport
+
+        fun trimNil(s: String?): String? {
+            if (s == null) return null
+            val t = s.trim()
+            return if (t.isEmpty()) null else t
+        }
+
+        val cleanedName = trimNil(name)
+        val cleanedEmail = trimNil(email)
+
+        val body = FeedbackRequestBody(
+            bundleId = snapshot.bundleId,
+            message = trimmed,
+            sessionId = snapshot.sessionId,
+            userId = snapshot.userId,
+            submitterName = cleanedName,
+            submitterEmail = cleanedEmail,
+            appVersion = snapshot.deviceInfo.appVersion,
+            sdkName = OwlmetryVersion.NAME,
+            sdkVersion = OwlmetryVersion.CURRENT,
+            environment = snapshot.deviceInfo.platform.wire,
+            deviceModel = snapshot.deviceInfo.deviceModel,
+            osVersion = snapshot.deviceInfo.osVersion,
+            isDev = snapshot.isDev,
+        )
+
+        return when (val result = transport.submitFeedback(body)) {
+            is FeedbackResult.Success -> {
+                // Audit trail — feedback submission is observable in the event
+                // stream. Pass an explicit, stable source so source_module is
+                // "Owl.kt:sendFeedback" (Swift uses #file/#function/#line of the
+                // SDK call site here, not the consumer's location).
+                log(
+                    message = "sdk:feedback_submitted",
+                    level = OwlLogLevel.INFO,
+                    screenName = null,
+                    attributes = mapOf(
+                        "has_email" to (if (cleanedEmail != null) "true" else "false"),
+                        "has_name" to (if (cleanedName != null) "true" else "false"),
+                    ),
+                    file = "Owl.kt",
+                    function = "sendFeedback",
+                    line = 0,
+                )
+                result.receipt
+            }
+            is FeedbackResult.Failure -> throw result.error
+        }
+    }
+
+    /** The bundle of configured state [sendFeedback] needs, snapshotted under the lock. */
+    private data class FeedbackSnapshot(
+        val transport: EventTransport,
+        val bundleId: String,
+        val deviceInfo: DeviceInfo,
+        val userId: String?,
+        val sessionId: String,
+        val isDev: Boolean,
+    )
+
     // MARK: - Funnel Steps
 
     /**

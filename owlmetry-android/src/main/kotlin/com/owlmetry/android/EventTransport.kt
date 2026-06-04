@@ -61,6 +61,7 @@ internal class EventTransport(
     private val ingestUrl = endpoint.appendPath("v1/ingest")
     private val claimUrl = endpoint.appendPath("v1/identity/claim")
     private val propertiesUrl = endpoint.appendPath("v1/identity/properties")
+    private val feedbackUrl = endpoint.appendPath("v1/feedback")
 
     private val bufferMutex = Mutex()
     private val buffer = ArrayList<LogEvent>()
@@ -258,6 +259,57 @@ internal class EventTransport(
     }
 
     /**
+     * One-shot synchronous feedback submission. Mirrors Swift's
+     * `submitFeedback(_:)`: encodes the body, POSTs it **once** (no retry, no
+     * offline queueing — the caller handles errors and decides whether to retry),
+     * and on 2xx parses `{ id, created_at }` into an [OwlFeedbackReceipt]. Unlike
+     * ingest, feedback is interactive: the user is staring at a spinner, so a
+     * single attempt with a typed failure is the right contract rather than
+     * silently retrying for 30s.
+     *
+     * Returns [FeedbackResult.Success] with the receipt, or [FeedbackResult.Failure]
+     * carrying a typed [OwlFeedbackError] (server non-2xx with the body verbatim,
+     * or a transport/encode/decode failure).
+     */
+    suspend fun submitFeedback(payload: FeedbackRequestBody): FeedbackResult {
+        val httpBody = runCatching { payload.toJsonString().toByteArray(Charsets.UTF_8) }
+            .getOrElse {
+                return FeedbackResult.Failure(
+                    OwlFeedbackError.TransportFailure("encoding failed: ${it.message}"),
+                )
+            }
+        val request = makeRequest(feedbackUrl, httpBody)
+
+        val response = withContext(ioDispatcher) {
+            runCatching { httpClient.execute(request) }
+        }
+
+        response.onSuccess { http ->
+            if (http.statusCode in 200..299) {
+                val receipt = runCatching {
+                    OwlFeedbackReceipt.fromJson(JSONObject(http.body ?: ""))
+                }.getOrElse {
+                    return FeedbackResult.Failure(
+                        OwlFeedbackError.TransportFailure("decode failed: ${it.message}"),
+                    )
+                }
+                return FeedbackResult.Success(receipt)
+            }
+            return FeedbackResult.Failure(
+                OwlFeedbackError.ServerError(statusCode = http.statusCode, body = http.body),
+            )
+        }.onFailure { error ->
+            return FeedbackResult.Failure(
+                OwlFeedbackError.TransportFailure(error.message ?: error.toString()),
+            )
+        }
+
+        // Unreachable — onSuccess/onFailure both return — but the compiler can't
+        // see that through the Result lambdas.
+        return FeedbackResult.Failure(OwlFeedbackError.TransportFailure("no response"))
+    }
+
+    /**
      * POST one ingest batch, tracking it as in-flight so [claimIdentity] can
      * drain. Mirrors Swift's `send(_:)`.
      */
@@ -364,6 +416,17 @@ internal class EventTransport(
         if (body.isNullOrEmpty()) return null
         return runCatching { JSONObject(body).optInt("rejected", 0) }.getOrNull()
     }
+}
+
+/**
+ * Outcome of a one-shot [EventTransport.submitFeedback] call. The Kotlin analog
+ * of Swift's `Result<OwlFeedbackReceipt, OwlFeedbackError>` returned by
+ * `submitFeedback`. Internal — [Owl.sendFeedback] unwraps this into a returned
+ * receipt or a thrown [OwlFeedbackError].
+ */
+internal sealed interface FeedbackResult {
+    data class Success(val receipt: OwlFeedbackReceipt) : FeedbackResult
+    data class Failure(val error: OwlFeedbackError) : FeedbackResult
 }
 
 /** A minimal HTTP request — the framework-agnostic input to [HttpClient]. */
