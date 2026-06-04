@@ -80,6 +80,18 @@ dependencies {
     debugImplementation(libs.compose.ui.test.manifest)
 }
 
+// AGP 8.7's JavaDocGenerationTask bundles an old Dokka whose ASM can't read the
+// `PermittedSubclasses` attribute on the Compose/AndroidX dependencies' sealed
+// classes (JDK 17+ bytecode → "PermittedSubclasses requires ASM9"), so javadoc
+// generation crashes and would fail every Maven Central publish. The core module
+// has no Compose deps and generates fine; only this module trips it. We don't ship
+// API docs inside the jar (they live at owlmetry.com/docs), so publish an EMPTY
+// javadoc jar: disabling the Dokka generation step leaves vanniktech's javaDocJar
+// to zip nothing into a valid, empty javadoc artifact that Central still accepts.
+tasks.matching { it.name == "javaDocReleaseGeneration" }.configureEach {
+    enabled = false
+}
+
 // Maven Central (Sonatype Central Portal) publishing for the Compose UI artifact.
 //
 // Signing + Sonatype credentials are supplied at publish time via Gradle
