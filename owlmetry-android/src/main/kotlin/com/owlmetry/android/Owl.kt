@@ -108,6 +108,13 @@ public object Owl {
         // Drops runaway duplicate events before they hit the transport buffer.
         // Started at configure(); its cleanup loop runs on the SDK scope.
         val duplicateFilter: DuplicateFilter,
+        // The bundle id, snapshotted so the questionnaire dismiss/save paths can
+        // read it without re-resolving the configuration.
+        val bundleId: String,
+        // Persistent launch/foreground/first-launch counters backing the
+        // questionnaire trigger conditions. Also published to
+        // OwlQuestionnaireState.shared so the Compose gate can read it.
+        val questionnaireState: OwlQuestionnaireState,
     )
 
     /**
@@ -186,6 +193,7 @@ public object Owl {
             httpClient = httpClientOverrideForTesting ?: DefaultHttpClient,
         )
         val duplicateFilter = DuplicateFilter()
+        val questionnaireState = OwlQuestionnaireState(appContext)
 
         var claimAnon: String? = null
         var claimUser: String? = null
@@ -235,13 +243,25 @@ public object Owl {
                 transport = transport,
                 networkMonitor = networkMonitor,
                 duplicateFilter = duplicateFilter,
+                bundleId = configuration.bundleId,
+                questionnaireState = questionnaireState,
             )
+            // Publish the state handle so the Compose trigger gate + the static
+            // launchCount/foregroundCount accessors can read counters without a
+            // Context. Mirrors Swift's `OwlQuestionnaireState.shared`.
+            OwlQuestionnaireState.shared = questionnaireState
         }
 
         // Start the flush loop + the dedup-cleanup loop. Both run on the SDK
         // scope; the filter's cleanup mirrors Swift's `filter.start()`.
         transport.start()
         duplicateFilter.start(scope)
+
+        // Bump the launch counter (idempotent per process) + record the install
+        // timestamp on first launch. Backs the questionnaire trigger conditions.
+        // Mirrors Swift's `OwlQuestionnaireState.shared.markConfiguredOnce()` at
+        // the tail of `configureWith`.
+        questionnaireState.markConfiguredOnce()
 
         // Emit the session-start event. Mirrors Swift's
         // `log("sdk:session_started", ...)` at the end of `configureWith`. The
@@ -464,6 +484,196 @@ public object Owl {
             awaitInFlightLogTasks()
             transport.setUserProperties(userId = userId, properties = properties)
         }
+    }
+
+    // MARK: - Questionnaires
+
+    /**
+     * Total number of times [configure] has completed since install (one bump
+     * per process). Backs `OwlQuestionnaireCondition.Launches`. Mirrors Swift
+     * `Owl.launchCount`. Zero before the first [configure].
+     */
+    public val launchCount: Int
+        get() = OwlQuestionnaireState.shared?.launchCount ?: 0
+
+    /**
+     * Total number of foreground transitions since install. Backs
+     * `OwlQuestionnaireCondition.Foregrounds`. Mirrors Swift `Owl.foregroundCount`.
+     */
+    public val foregroundCount: Int
+        get() = OwlQuestionnaireState.shared?.foregroundCount ?: 0
+
+    /**
+     * Epoch-millis timestamp of the first-ever [configure] on this install, or
+     * null if none recorded. Mirrors Swift `Owl.firstLaunchAt` (a `Date` there;
+     * epoch millis here, matching [OwlQuestionnaireState]).
+     */
+    public val firstLaunchAt: Long?
+        get() = OwlQuestionnaireState.shared?.firstLaunchAt
+
+    /**
+     * Fetch a questionnaire by slug, plus any in-progress draft the caller
+     * already started. The result's `questionnaire` is null when the user is
+     * ineligible (already responded, globally dismissed, or the questionnaire is
+     * inactive — in that case `ineligibleReason` is set). Mirrors Swift
+     * `Owl.fetchQuestionnaire(slug:force:)`.
+     *
+     * Pass [force] = true to ask the server to ignore `alreadyResponded` and
+     * `globallyDismissed` — useful for previewing the questionnaire UI in debug
+     * builds without resetting state. `inactive` is still respected.
+     *
+     * @throws OwlQuestionnaireError.NotConfigured if [configure] has not run.
+     * @throws OwlQuestionnaireError.SlugNotFound if the slug doesn't exist.
+     * @throws OwlQuestionnaireError.ServerError / TransportFailure on failure.
+     */
+    public suspend fun fetchQuestionnaire(
+        slug: String,
+        force: Boolean = false,
+    ): OwlQuestionnaireFetchResult {
+        val snapshot = transportSnapshot() ?: throw OwlQuestionnaireError.NotConfigured
+        return when (val outcome = snapshot.transport.fetchQuestionnaire(slug = slug, userId = snapshot.userId, force = force)) {
+            is QuestionnaireFetchOutcome.Success -> outcome.result
+            is QuestionnaireFetchOutcome.Failure -> throw outcome.error
+        }
+    }
+
+    /**
+     * Save a partial answer set ([isComplete] false) or finalize a submission
+     * ([isComplete] true). The server upserts by `(project, slug, user_id)`, so
+     * the SDK doesn't track the response id across calls — every save sends the
+     * full accumulated answer set and the server merges. The returned receipt's
+     * `wasSubmitted` is `true` exactly once per response (the call that flipped
+     * `submitted_at` from null) and drives the flow container's success
+     * transition. Telemetry: emits `sdk:questionnaire_submitted` only on the
+     * flip — silent on partial saves to avoid flooding the event stream. Mirrors
+     * Swift `Owl.saveQuestionnaireResponse`.
+     */
+    public suspend fun saveQuestionnaireResponse(
+        slug: String,
+        answers: Map<String, OwlQuestionnaireAnswerValue>,
+        isComplete: Boolean,
+    ): OwlQuestionnaireReceipt {
+        val snapshot = transportSnapshot() ?: throw OwlQuestionnaireError.NotConfigured
+
+        val outcome = snapshot.transport.saveQuestionnaireResponse(
+            slug = slug,
+            userId = snapshot.userId,
+            sessionId = snapshot.sessionId,
+            answers = answers,
+            isComplete = isComplete,
+            deviceInfo = snapshot.deviceInfo,
+            environment = snapshot.deviceInfo.platform.wire,
+            appVersion = snapshot.deviceInfo.appVersion,
+            isDev = snapshot.isDev,
+        )
+        return when (outcome) {
+            is QuestionnaireSaveOutcome.Success -> {
+                if (outcome.receipt.wasSubmitted) {
+                    log(
+                        message = "sdk:questionnaire_submitted",
+                        level = OwlLogLevel.INFO,
+                        screenName = null,
+                        attributes = mapOf("slug" to slug),
+                        file = "Owl.kt",
+                        function = "saveQuestionnaireResponse",
+                        line = 0,
+                    )
+                }
+                outcome.receipt
+            }
+            is QuestionnaireSaveOutcome.Failure -> throw outcome.error
+        }
+    }
+
+    /**
+     * Globally opt the current user out of every questionnaire. Idempotent.
+     * Survives reinstall server-side (stored in `app_users.properties`). Mirrors
+     * Swift `Owl.dismissQuestionnaires`. Returns the server's `dismissed_at`.
+     *
+     * @throws OwlQuestionnaireError.NotConfigured if [configure] has not run.
+     */
+    public suspend fun dismissQuestionnaires(): java.util.Date {
+        val snapshot = transportSnapshot()
+        val userId = snapshot?.userId
+        if (snapshot == null || userId == null) throw OwlQuestionnaireError.NotConfigured
+        return when (val outcome = snapshot.transport.submitQuestionnaireDismiss(userId = userId)) {
+            is QuestionnaireDismissOutcome.Success -> {
+                log(
+                    message = "sdk:questionnaire_dismissed",
+                    level = OwlLogLevel.INFO,
+                    screenName = null,
+                    attributes = null,
+                    file = "Owl.kt",
+                    function = "dismissQuestionnaires",
+                    line = 0,
+                )
+                outcome.dismissedAt
+            }
+            is QuestionnaireDismissOutcome.Failure -> throw outcome.error
+        }
+    }
+
+    // Process-local dedupe so a single launch doesn't re-present the same slug
+    // even if the gate's evaluation re-enters or two modifiers with the same
+    // slug both fire. Cross-launch dedupe is the server's job. Guarded by
+    // [shownLock]; mirrors Swift's `shownSlugs` set.
+    private val shownLock = Any()
+    private val shownSlugs = HashSet<String>()
+
+    /** Whether [slug] has already been presented in this process. */
+    public fun questionnaireWasShownThisProcess(slug: String): Boolean =
+        synchronized(shownLock) { shownSlugs.contains(slug) }
+
+    /** Mark [slug] as presented in this process. */
+    public fun markQuestionnaireShown(slug: String) {
+        synchronized(shownLock) { shownSlugs.add(slug) }
+    }
+
+    /**
+     * Debug-only — clears the in-process "already shown this slug" cache so the
+     * Compose trigger can re-evaluate without an app relaunch. Intended for QA
+     * and demo apps. Server-side eligibility (already-responded,
+     * globally-dismissed) is NOT affected — combine with
+     * `Owl.clearUser(newAnonymousId = true)` to test against a fresh user.
+     * Mirrors Swift `Owl._debugClearShownQuestionnaires`.
+     */
+    public fun debugClearShownQuestionnaires() {
+        synchronized(shownLock) { shownSlugs.clear() }
+    }
+
+    /** Snapshot of the configured state the questionnaire calls need. */
+    private data class QuestionnaireTransportSnapshot(
+        val transport: EventTransport,
+        val userId: String?,
+        val sessionId: String,
+        val deviceInfo: DeviceInfo,
+        val isDev: Boolean,
+    )
+
+    /**
+     * Snapshot the transport-side state for a questionnaire call under [lock],
+     * or null (warned once) before [configure]. Mirrors Swift's
+     * `transportSnapshot()`.
+     */
+    private fun transportSnapshot(): QuestionnaireTransportSnapshot? = synchronized(lock) {
+        val s = state
+        if (s == null) {
+            if (!hasWarnedNotConfigured) {
+                hasWarnedNotConfigured = true
+                android.util.Log.w(
+                    ConsoleLogger.TAG,
+                    "Owl.configure() has not been called. Questionnaire call dropped.",
+                )
+            }
+            return@synchronized null
+        }
+        QuestionnaireTransportSnapshot(
+            transport = s.transport,
+            userId = s.defaultUserId,
+            sessionId = s.sessionId,
+            deviceInfo = s.deviceInfo,
+            isDev = s.isDev,
+        )
     }
 
     // MARK: - Feedback
@@ -912,7 +1122,9 @@ public object Owl {
             drainsToResume = pendingLogDrains.toList()
             pendingLogDrains.clear()
             hasWarnedNotConfigured = false
+            OwlQuestionnaireState.shared = null
         }
+        synchronized(shownLock) { shownSlugs.clear() }
         for (waiter in drainsToResume) waiter.complete(Unit)
     }
 }

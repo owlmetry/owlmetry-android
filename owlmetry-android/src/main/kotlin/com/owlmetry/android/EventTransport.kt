@@ -62,6 +62,11 @@ internal class EventTransport(
     private val claimUrl = endpoint.appendPath("v1/identity/claim")
     private val propertiesUrl = endpoint.appendPath("v1/identity/properties")
     private val feedbackUrl = endpoint.appendPath("v1/feedback")
+    private val questionnaireDismissUrl = endpoint.appendPath("v1/questionnaires/dismiss")
+
+    // Held so the questionnaire URLs (which interpolate the slug + query string)
+    // can be built per-call. The endpoint base is normalized once here.
+    private val endpointBase: URL = endpoint
 
     private val bufferMutex = Mutex()
     private val buffer = ArrayList<LogEvent>()
@@ -309,6 +314,179 @@ internal class EventTransport(
         return FeedbackResult.Failure(OwlFeedbackError.TransportFailure("no response"))
     }
 
+    // MARK: - Questionnaires
+
+    private fun questionnaireUrl(slug: String): URL =
+        endpointBase.appendPath("v1/questionnaires/${slug.urlPathEncoded()}")
+
+    private fun questionnaireResponsesUrl(slug: String): URL =
+        endpointBase.appendPath("v1/questionnaires/${slug.urlPathEncoded()}/responses")
+
+    /**
+     * Fetch a questionnaire spec + eligibility envelope. The success branch
+     * carries the spec (null when the user is ineligible) plus, on eligible
+     * returns, any in-progress draft so the flow container can pre-fill and
+     * resume. The ineligibility reason is surfaced for diagnostics but the SDK
+     * still treats already_responded / globally_dismissed / inactive as silent
+     * no-ops. Returns [QuestionnaireFetchResult.Failure] only for slug-not-found
+     * (404) and transport failures. Mirrors Swift's `fetchQuestionnaire`.
+     */
+    suspend fun fetchQuestionnaire(
+        slug: String,
+        userId: String?,
+        force: Boolean = false,
+    ): QuestionnaireFetchOutcome {
+        val query = StringBuilder("?bundle_id=").append(bundleId.urlQueryEncoded())
+        if (userId != null) query.append("&user_id=").append(userId.urlQueryEncoded())
+        if (force) query.append("&force=true")
+
+        val url = runCatching { URL(questionnaireUrl(slug).toString() + query.toString()) }
+            .getOrElse { return QuestionnaireFetchOutcome.Failure(OwlQuestionnaireError.TransportFailure("invalid URL")) }
+
+        val request = HttpRequest(
+            url = url,
+            method = "GET",
+            headers = mapOf(
+                "Authorization" to "Bearer $apiKey",
+                "Accept" to "application/json",
+            ),
+            body = null,
+        )
+
+        val response = withContext(ioDispatcher) { runCatching { httpClient.execute(request) } }
+            .getOrElse { return QuestionnaireFetchOutcome.Failure(OwlQuestionnaireError.TransportFailure(it.message ?: it.toString())) }
+
+        if (response.statusCode == 404) {
+            return QuestionnaireFetchOutcome.Failure(OwlQuestionnaireError.SlugNotFound)
+        }
+        if (response.statusCode !in 200..299) {
+            return QuestionnaireFetchOutcome.Failure(
+                OwlQuestionnaireError.ServerError(response.statusCode, response.body),
+            )
+        }
+
+        val result = runCatching { parseFetchEnvelope(response.body) }
+            .getOrElse { return QuestionnaireFetchOutcome.Failure(OwlQuestionnaireError.TransportFailure("decode failed: ${it.message}")) }
+        return QuestionnaireFetchOutcome.Success(result)
+    }
+
+    /** Decode the eligibility envelope into an [OwlQuestionnaireFetchResult]. */
+    private fun parseFetchEnvelope(body: String?): OwlQuestionnaireFetchResult {
+        val json = JSONObject(body ?: "")
+        val eligible = json.optBoolean("eligible", false)
+        val questionnaireJson = json.optJSONObject("questionnaire")
+        if (eligible && questionnaireJson != null) {
+            val questionnaire = OwlQuestionnaire.fromJson(questionnaireJson)
+            val inProgressJson = json.optJSONObject("in_progress")
+            val draft = inProgressJson?.let {
+                OwlQuestionnaireDraft(
+                    responseId = it.optString("response_id"),
+                    answers = hydrateDraftAnswers(
+                        it.optJSONObject("answers") ?: JSONObject(),
+                        questionnaire.schema,
+                    ),
+                )
+            }
+            return OwlQuestionnaireFetchResult(questionnaire = questionnaire, inProgress = draft)
+        }
+        // Ineligible — surface the reason for diagnostics.
+        val reason = OwlQuestionnaireIneligibleReason.fromWire(json.optStringOrNull("reason"))
+        return OwlQuestionnaireFetchResult(questionnaire = null, ineligibleReason = reason)
+    }
+
+    /**
+     * Save a draft ([isComplete] false) or finalize a submission ([isComplete]
+     * true). The server upserts by `(project, slug, user_id)` — the SDK is
+     * stateless across calls and doesn't track the response id. The returned
+     * receipt's `wasSubmitted` is `true` exactly once per response (the call
+     * that flipped `submitted_at` null → non-null) and is what the flow
+     * container uses to transition into the success phase. Mirrors Swift's
+     * `saveQuestionnaireResponse`.
+     */
+    suspend fun saveQuestionnaireResponse(
+        slug: String,
+        userId: String?,
+        sessionId: String?,
+        answers: Map<String, OwlQuestionnaireAnswerValue>,
+        isComplete: Boolean,
+        deviceInfo: DeviceInfo?,
+        environment: String?,
+        appVersion: String?,
+        isDev: Boolean,
+    ): QuestionnaireSaveOutcome {
+        val payload = JSONObject().apply {
+            put("bundle_id", bundleId)
+            sessionId?.let { put("session_id", it) }
+            userId?.let { put("user_id", it) }
+            put("answers", encodeAnswers(answers))
+            put("is_complete", isComplete)
+            appVersion?.let { put("app_version", it) }
+            put("sdk_name", OwlmetryVersion.NAME)
+            put("sdk_version", OwlmetryVersion.CURRENT)
+            environment?.let { put("environment", it) }
+            deviceInfo?.deviceModel?.let { put("device_model", it) }
+            deviceInfo?.osVersion?.let { put("os_version", it) }
+            put("is_dev", isDev)
+        }
+
+        val httpBody = runCatching { payload.toString().toByteArray(Charsets.UTF_8) }
+            .getOrElse { return QuestionnaireSaveOutcome.Failure(OwlQuestionnaireError.TransportFailure("encoding failed: ${it.message}")) }
+
+        val request = makeRequest(questionnaireResponsesUrl(slug), httpBody)
+        val response = withContext(ioDispatcher) { runCatching { httpClient.execute(request) } }
+            .getOrElse { return QuestionnaireSaveOutcome.Failure(OwlQuestionnaireError.TransportFailure(it.message ?: it.toString())) }
+
+        if (response.statusCode in 200..299) {
+            val receipt = runCatching {
+                val json = JSONObject(response.body ?: "")
+                OwlQuestionnaireReceipt(
+                    id = json.optString("id"),
+                    createdAt = QuestionnaireDates.parseOrNow(json.optStringOrNull("created_at")),
+                    wasSubmitted = json.optBoolean("was_submitted", false),
+                )
+            }.getOrElse { return QuestionnaireSaveOutcome.Failure(OwlQuestionnaireError.TransportFailure("decode failed: ${it.message}")) }
+            return QuestionnaireSaveOutcome.Success(receipt)
+        }
+        if (response.statusCode == 400) {
+            return QuestionnaireSaveOutcome.Failure(
+                OwlQuestionnaireError.InvalidAnswers(response.body ?: "unknown"),
+            )
+        }
+        if (response.statusCode == 404) {
+            return QuestionnaireSaveOutcome.Failure(OwlQuestionnaireError.SlugNotFound)
+        }
+        return QuestionnaireSaveOutcome.Failure(
+            OwlQuestionnaireError.ServerError(response.statusCode, response.body),
+        )
+    }
+
+    /**
+     * Globally opt the current user out of every questionnaire. Idempotent on
+     * the server side. Mirrors Swift's `submitQuestionnaireDismiss`.
+     */
+    suspend fun submitQuestionnaireDismiss(userId: String): QuestionnaireDismissOutcome {
+        val payload = JSONObject().apply {
+            put("bundle_id", bundleId)
+            put("user_id", userId)
+        }
+        val httpBody = runCatching { payload.toString().toByteArray(Charsets.UTF_8) }
+            .getOrElse { return QuestionnaireDismissOutcome.Failure(OwlQuestionnaireError.TransportFailure("encoding failed: ${it.message}")) }
+
+        val request = makeRequest(questionnaireDismissUrl, httpBody)
+        val response = withContext(ioDispatcher) { runCatching { httpClient.execute(request) } }
+            .getOrElse { return QuestionnaireDismissOutcome.Failure(OwlQuestionnaireError.TransportFailure(it.message ?: it.toString())) }
+
+        if (response.statusCode in 200..299) {
+            val date = runCatching {
+                QuestionnaireDates.parseOrNow(JSONObject(response.body ?: "").optStringOrNull("dismissed_at"))
+            }.getOrElse { return QuestionnaireDismissOutcome.Failure(OwlQuestionnaireError.TransportFailure("decode failed: ${it.message}")) }
+            return QuestionnaireDismissOutcome.Success(date)
+        }
+        return QuestionnaireDismissOutcome.Failure(
+            OwlQuestionnaireError.ServerError(response.statusCode, response.body),
+        )
+    }
+
     /**
      * POST one ingest batch, tracking it as in-flight so [claimIdentity] can
      * drain. Mirrors Swift's `send(_:)`.
@@ -429,6 +607,28 @@ internal sealed interface FeedbackResult {
     data class Failure(val error: OwlFeedbackError) : FeedbackResult
 }
 
+/**
+ * Outcome of [EventTransport.fetchQuestionnaire]. The Kotlin analog of Swift's
+ * `Result<OwlQuestionnaireFetchResult, OwlQuestionnaireError>`. Internal — [Owl]
+ * unwraps it into a returned result or a thrown [OwlQuestionnaireError].
+ */
+internal sealed interface QuestionnaireFetchOutcome {
+    data class Success(val result: OwlQuestionnaireFetchResult) : QuestionnaireFetchOutcome
+    data class Failure(val error: OwlQuestionnaireError) : QuestionnaireFetchOutcome
+}
+
+/** Outcome of [EventTransport.saveQuestionnaireResponse]. */
+internal sealed interface QuestionnaireSaveOutcome {
+    data class Success(val receipt: OwlQuestionnaireReceipt) : QuestionnaireSaveOutcome
+    data class Failure(val error: OwlQuestionnaireError) : QuestionnaireSaveOutcome
+}
+
+/** Outcome of [EventTransport.submitQuestionnaireDismiss]. */
+internal sealed interface QuestionnaireDismissOutcome {
+    data class Success(val dismissedAt: java.util.Date) : QuestionnaireDismissOutcome
+    data class Failure(val error: OwlQuestionnaireError) : QuestionnaireDismissOutcome
+}
+
 /** A minimal HTTP request — the framework-agnostic input to [HttpClient]. */
 internal data class HttpRequest(
     val url: URL,
@@ -499,3 +699,16 @@ private fun URL.appendPath(path: String): URL {
     val base = toString().trimEnd('/')
     return URL("$base/${path.trimStart('/')}")
 }
+
+/**
+ * Percent-encode a path segment (e.g. a questionnaire slug). Slugs are already
+ * `[a-z0-9-]`, but encode defensively so a malformed slug can't break the path.
+ * `URLEncoder` targets the query grammar (`+` for space), so convert `+` back to
+ * `%20` for path use.
+ */
+private fun String.urlPathEncoded(): String =
+    java.net.URLEncoder.encode(this, "UTF-8").replace("+", "%20")
+
+/** Percent-encode a query-parameter value (`+` for space is correct here). */
+private fun String.urlQueryEncoded(): String =
+    java.net.URLEncoder.encode(this, "UTF-8")
