@@ -115,6 +115,13 @@ public object Owl {
         // questionnaire trigger conditions. Also published to
         // OwlQuestionnaireState.shared so the Compose gate can read it.
         val questionnaireState: OwlQuestionnaireState,
+        // Uploads event attachments (reserve + PUT). Held so the logging path
+        // can enqueue attachments tagged with the event's client_event_id.
+        val attachmentUploader: AttachmentUploader,
+        // Process-lifecycle observer that flushes the transport on background
+        // and bumps the foreground counter. Null when flushOnBackground is off
+        // (matches Swift). Held so it can be stopped on reset/re-configure.
+        val lifecycleObserver: LifecycleObserver?,
     )
 
     /**
@@ -194,6 +201,21 @@ public object Owl {
         )
         val duplicateFilter = DuplicateFilter()
         val questionnaireState = OwlQuestionnaireState(appContext)
+        val attachmentUploader = AttachmentUploader(
+            endpoint = configuration.endpoint.toURL(),
+            apiKey = configuration.apiKey,
+            scope = scope,
+            httpClient = httpClientOverrideForTesting ?: DefaultHttpClient,
+        )
+        // The process-lifecycle flush observer — only when flushOnBackground is
+        // on (Swift gates the same way). Constructed here but registered after
+        // the state is published (it touches the main-thread lifecycle owner).
+        val lifecycleObserver: LifecycleObserver? =
+            if (configuration.flushOnBackground) {
+                LifecycleObserver(transport = transport, scope = scope)
+            } else {
+                null
+            }
 
         var claimAnon: String? = null
         var claimUser: String? = null
@@ -245,6 +267,8 @@ public object Owl {
                 duplicateFilter = duplicateFilter,
                 bundleId = configuration.bundleId,
                 questionnaireState = questionnaireState,
+                attachmentUploader = attachmentUploader,
+                lifecycleObserver = lifecycleObserver,
             )
             // Publish the state handle so the Compose trigger gate + the static
             // launchCount/foregroundCount accessors can read counters without a
@@ -257,6 +281,12 @@ public object Owl {
         transport.start()
         duplicateFilter.start(scope)
 
+        // Register the background-flush observer with the process lifecycle.
+        // Done after publishing state so the first ON_START it may immediately
+        // receive (if the app is already foregrounded) sees a configured SDK.
+        // Mirrors Swift's `lifecycleObserver?.start()`.
+        lifecycleObserver?.start()
+
         // Bump the launch counter (idempotent per process) + record the install
         // timestamp on first launch. Backs the questionnaire trigger conditions.
         // Mirrors Swift's `OwlQuestionnaireState.shared.markConfiguredOnce()` at
@@ -264,15 +294,18 @@ public object Owl {
         questionnaireState.markConfiguredOnce()
 
         // Emit the session-start event. Mirrors Swift's
-        // `log("sdk:session_started", ...)` at the end of `configureWith`. The
-        // process-launch-duration attribute Swift attaches via sysctl has no
-        // portable Android equivalent, so it's omitted (the event itself is the
-        // load-bearing signal; `_launch_ms` is best-effort telemetry).
+        // `log("sdk:session_started", ...)` at the end of `configureWith`,
+        // including the `_launch_ms` attribute when a process-start time is
+        // available. Swift reads process start via sysctl; the Android analog is
+        // `Process.getStartUptimeMillis()` (API 24+) against the same uptime
+        // clock — process start → now (this configure), the time-to-SDK-ready
+        // telemetry. Best-effort: omitted when non-positive or unavailable.
+        val launchMs = processLaunchDurationMs()
         log(
             message = "sdk:session_started",
             level = OwlLogLevel.INFO,
             screenName = null,
-            attributes = null,
+            attributes = launchMs?.let { mapOf("_launch_ms" to it.toString()) },
         )
 
         // Fire the optional startup claim outside the lock — claimIdentity
@@ -387,11 +420,12 @@ public object Owl {
         message: String,
         screenName: String? = null,
         attributes: Map<String, String?> = emptyMap(),
+        attachments: List<OwlAttachment>? = null,
         file: String = DEFAULT_FILE,
         function: String = DEFAULT_FUNCTION,
         line: Int = 0,
     ) {
-        log(message, OwlLogLevel.INFO, screenName, cleanAttributes(attributes), file, function, line)
+        log(message, OwlLogLevel.INFO, screenName, cleanAttributes(attributes), attachments, file, function, line)
     }
 
     /** Log a **debug**-level event. See [info] for parameter semantics. Mirrors Swift `Owl.debug(_:)`. */
@@ -399,11 +433,12 @@ public object Owl {
         message: String,
         screenName: String? = null,
         attributes: Map<String, String?> = emptyMap(),
+        attachments: List<OwlAttachment>? = null,
         file: String = DEFAULT_FILE,
         function: String = DEFAULT_FUNCTION,
         line: Int = 0,
     ) {
-        log(message, OwlLogLevel.DEBUG, screenName, cleanAttributes(attributes), file, function, line)
+        log(message, OwlLogLevel.DEBUG, screenName, cleanAttributes(attributes), attachments, file, function, line)
     }
 
     /** Log a **warn**-level event. See [info] for parameter semantics. Mirrors Swift `Owl.warn(_:)`. */
@@ -411,11 +446,12 @@ public object Owl {
         message: String,
         screenName: String? = null,
         attributes: Map<String, String?> = emptyMap(),
+        attachments: List<OwlAttachment>? = null,
         file: String = DEFAULT_FILE,
         function: String = DEFAULT_FUNCTION,
         line: Int = 0,
     ) {
-        log(message, OwlLogLevel.WARN, screenName, cleanAttributes(attributes), file, function, line)
+        log(message, OwlLogLevel.WARN, screenName, cleanAttributes(attributes), attachments, file, function, line)
     }
 
     /** Log an **error**-level event from a free-text message. See [info] for parameter semantics. Mirrors Swift `Owl.error(_:)`. */
@@ -423,11 +459,12 @@ public object Owl {
         message: String,
         screenName: String? = null,
         attributes: Map<String, String?> = emptyMap(),
+        attachments: List<OwlAttachment>? = null,
         file: String = DEFAULT_FILE,
         function: String = DEFAULT_FUNCTION,
         line: Int = 0,
     ) {
-        log(message, OwlLogLevel.ERROR, screenName, cleanAttributes(attributes), file, function, line)
+        log(message, OwlLogLevel.ERROR, screenName, cleanAttributes(attributes), attachments, file, function, line)
     }
 
     /**
@@ -447,6 +484,7 @@ public object Owl {
         message: String? = null,
         screenName: String? = null,
         attributes: Map<String, String?> = emptyMap(),
+        attachments: List<OwlAttachment>? = null,
         file: String = DEFAULT_FILE,
         function: String = DEFAULT_FUNCTION,
         line: Int = 0,
@@ -459,7 +497,7 @@ public object Owl {
         // values (Swift merges `extracted.attributes` on top).
         merged.putAll(extracted.attributes)
 
-        log(extracted.message, OwlLogLevel.ERROR, screenName, merged, file, function, line)
+        log(extracted.message, OwlLogLevel.ERROR, screenName, merged, attachments, file, function, line)
     }
 
     // MARK: - User Properties
@@ -983,6 +1021,7 @@ public object Owl {
         level: OwlLogLevel,
         screenName: String?,
         attributes: Map<String, String>?,
+        attachments: List<OwlAttachment>? = null,
         file: String = DEFAULT_FILE,
         function: String = DEFAULT_FUNCTION,
         line: Int = 0,
@@ -1014,6 +1053,7 @@ public object Owl {
                 networkStatus = s.networkMonitor.status.wire,
                 consoleLogging = s.configuration.consoleLogging,
                 scope = sdkScope,
+                attachmentUploader = s.attachmentUploader,
             )
         }
 
@@ -1064,6 +1104,22 @@ public object Owl {
                 decrementInFlightLogTasks()
             }
         }
+
+        // Upload any attachments tagged with this event's client_event_id, on a
+        // separate coroutine so the event-enqueue path above isn't blocked by
+        // the (potentially large) upload. Mirrors Swift's separate
+        // `Task { await uploader.enqueue(...) }`. The uploader serializes its own
+        // queue, so concurrent log calls with attachments don't race.
+        if (!attachments.isNullOrEmpty()) {
+            scope.launch {
+                snapshot.attachmentUploader.enqueue(
+                    clientEventId = event.clientEventId,
+                    userId = snapshot.userId,
+                    isDev = snapshot.isDev,
+                    attachments = attachments,
+                )
+            }
+        }
     }
 
     /** Decrement the in-flight counter and release waiters once it hits zero. */
@@ -1092,6 +1148,7 @@ public object Owl {
         val networkStatus: String,
         val consoleLogging: Boolean,
         val scope: CoroutineScope?,
+        val attachmentUploader: AttachmentUploader,
     )
 
     /**
@@ -1103,10 +1160,45 @@ public object Owl {
     internal fun resolveIsDev(context: Context): Boolean =
         (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
 
+    /**
+     * Milliseconds from process start to now, or null if non-positive /
+     * unavailable. The Android analog of Swift's sysctl-based
+     * `processLaunchDurationMs()`. `Process.getStartUptimeMillis()` (API 24+,
+     * our minSdk) returns the process start instant on the same monotonic
+     * uptime clock as `SystemClock.uptimeMillis()`, so the difference is a clean
+     * "time since the process launched" measurement — exactly the signal Swift
+     * captures, used for the `_launch_ms` attribute on `sdk:session_started`.
+     */
+    private fun processLaunchDurationMs(): Long? {
+        val startUptime = android.os.Process.getStartUptimeMillis()
+        val ms = android.os.SystemClock.uptimeMillis() - startUptime
+        return if (ms > 0) ms else null
+    }
+
+    /**
+     * Flush all buffered events and stop the background-flush observer. The
+     * suspending analog of Swift's `Owl.shutdown()`. Call before a deliberate
+     * teardown (e.g. process exit in a test harness) to drain the buffer; the
+     * SDK can be [configure]d again afterward.
+     *
+     * No-op before [configure]. Unlike [resetForTesting] this does not tear down
+     * the SDK scope or clear identity — it only stops the lifecycle observer and
+     * drives the transport's own `shutdown()` (cancel flush loop + `flushAll`).
+     */
+    public suspend fun shutdown() {
+        val (transport, observer) = synchronized(lock) {
+            val s = state ?: return
+            s.transport to s.lifecycleObserver
+        }
+        observer?.stop()
+        transport.shutdown()
+    }
+
     /** Test/teardown hook — clears configured state + any stashed identity ops. */
     internal fun resetForTesting() {
         val drainsToResume: List<CompletableDeferred<Unit>>
         synchronized(lock) {
+            state?.lifecycleObserver?.stop()
             state?.networkMonitor?.stop()
             sdkScope?.cancel()
             sdkScope = null

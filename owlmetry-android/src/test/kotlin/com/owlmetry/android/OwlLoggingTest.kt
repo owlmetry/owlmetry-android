@@ -229,6 +229,21 @@ class OwlLoggingTest {
     }
 
     @Test
+    fun sessionStartedCarriesNonNegativeLaunchMsWhenPresent() {
+        configure()
+        drainAndPoll { http.eventsMatching { it.getString("message") == "sdk:session_started" }.isNotEmpty() }
+        val session = http.eventsMatching { it.getString("message") == "sdk:session_started" }.first()
+        // `_launch_ms` is best-effort (omitted only on a non-positive process-start
+        // delta). When present it must be a non-negative integer string — the
+        // Android analog of Swift's sysctl process-launch-duration.
+        val attrs = if (session.has("custom_attributes")) session.getJSONObject("custom_attributes") else null
+        if (attrs != null && attrs.has("_launch_ms")) {
+            val launchMs = attrs.getString("_launch_ms").toLong()
+            assertTrue("_launch_ms must be >= 0, was $launchMs", launchMs >= 0)
+        }
+    }
+
+    @Test
     fun claimPostArrivesAfterAllPriorIngestPosts() {
         // SetUserRace port: a burst of logs followed immediately by setUser must
         // have the claim POST land at/after the last burst-event ingest, or the
