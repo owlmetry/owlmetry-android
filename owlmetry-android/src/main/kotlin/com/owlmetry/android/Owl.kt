@@ -442,6 +442,144 @@ public object Owl {
         log(extracted.message, OwlLogLevel.ERROR, screenName, merged, file, function, line)
     }
 
+    // MARK: - User Properties
+
+    /**
+     * Set custom properties on the current user. Properties are **merged**
+     * server-side — existing keys not in this call are preserved. Pass an empty
+     * string value to remove a property. Mirrors Swift `Owl.setUserProperties`.
+     *
+     * No-op before [configure] (no resolved user id / transport yet). When
+     * configured, the POST is gated behind [awaitInFlightLogTasks] — symmetric
+     * with [setUser] — so any in-flight `Owl.log(...)` coroutines reach the
+     * transport first and the server's `app_users` upsert sequencing stays
+     * consistent.
+     */
+    public fun setUserProperties(properties: Map<String, String>) {
+        val (userId, transport) = synchronized(lock) {
+            val s = state ?: return
+            s.defaultUserId to s.transport
+        }
+        sdkScope?.launch {
+            awaitInFlightLogTasks()
+            transport.setUserProperties(userId = userId, properties = properties)
+        }
+    }
+
+    // MARK: - Funnel Steps
+
+    /**
+     * Record a funnel step. Emits an **info**-level event with message
+     * `"step:<stepName>"`. Mirrors Swift `Owl.step(_:)`.
+     *
+     * See [info] for [attributes] / [screenName] / call-site parameter
+     * semantics. [attributes] values may be null; nulls are dropped.
+     */
+    public fun step(
+        stepName: String,
+        attributes: Map<String, String?> = emptyMap(),
+        file: String = DEFAULT_FILE,
+        function: String = DEFAULT_FUNCTION,
+        line: Int = 0,
+    ) {
+        info("step:$stepName", attributes = attributes, file = file, function = function, line = line)
+    }
+
+    /**
+     * Record a funnel step.
+     *
+     * @deprecated Use [step] instead. Retained for source compatibility with the
+     * legacy `track:` prefix (see [ConsoleLogger]); forwards to [step], so the
+     * emitted message is `"step:<stepName>"`, identical to Swift's deprecated
+     * `Owl.track(_:)` which also forwards to `step`.
+     */
+    @Deprecated("Use step(stepName, ...) instead.", ReplaceWith("step(stepName, attributes, file, function, line)"))
+    public fun track(
+        stepName: String,
+        attributes: Map<String, String?> = emptyMap(),
+        file: String = DEFAULT_FILE,
+        function: String = DEFAULT_FUNCTION,
+        line: Int = 0,
+    ) {
+        step(stepName, attributes = attributes, file = file, function = function, line = line)
+    }
+
+    // MARK: - Structured Metrics
+
+    /**
+     * Start a tracked operation. Returns an [OwlOperation] whose [complete][OwlOperation.complete],
+     * [fail][OwlOperation.fail], or [cancel][OwlOperation.cancel] method should be
+     * called when the operation finishes. Mirrors Swift `Owl.startOperation`.
+     *
+     * The [metric] slug should contain only lowercase letters, numbers, and
+     * hyphens (e.g. `"photo-conversion"`, `"api-request"`). Invalid characters
+     * are auto-corrected via [normalizeSlug] with a warning logged.
+     *
+     * Emits an **info**-level `metric:<slug>:start` event tagged with the new
+     * operation's `tracking_id`.
+     */
+    public fun startOperation(
+        metric: String,
+        attributes: Map<String, String?> = emptyMap(),
+        file: String = DEFAULT_FILE,
+        function: String = DEFAULT_FUNCTION,
+        line: Int = 0,
+    ): OwlOperation {
+        val slug = normalizeSlug(metric)
+        val op = OwlOperation(metric = slug)
+        val attrs = LinkedHashMap<String, String?>(attributes)
+        attrs["tracking_id"] = op.trackingId
+        info("metric:$slug:start", attributes = attrs, file = file, function = function, line = line)
+        return op
+    }
+
+    /**
+     * Record a single-shot metric (no lifecycle). Emits an **info**-level
+     * `metric:<slug>:record` event. Mirrors Swift `Owl.recordMetric`.
+     *
+     * The [metric] slug should contain only lowercase letters, numbers, and
+     * hyphens (e.g. `"onboarding"`, `"checkout"`). Invalid characters are
+     * auto-corrected via [normalizeSlug] with a warning logged.
+     */
+    public fun recordMetric(
+        metric: String,
+        attributes: Map<String, String?> = emptyMap(),
+        file: String = DEFAULT_FILE,
+        function: String = DEFAULT_FUNCTION,
+        line: Int = 0,
+    ) {
+        val slug = normalizeSlug(metric)
+        info("metric:$slug:record", attributes = attributes, file = file, function = function, line = line)
+    }
+
+    /** Matches a slug already containing only lowercase letters, numbers, and hyphens. */
+    private val slugRegex = Regex("^[a-z0-9-]+$")
+
+    /**
+     * Normalize a metric/funnel slug to lowercase letters, numbers, and hyphens
+     * only; logs a warning (via Logcat — the analog of Swift's `logger.warning`)
+     * when the slug was modified. Mirrors Swift's private `normalizeSlug`:
+     * already-valid slugs pass through untouched; otherwise lowercase →
+     * replace every run of invalid chars (each char individually) with `-` →
+     * collapse `--+` to `-` → strip leading/trailing `-`.
+     */
+    internal fun normalizeSlug(slug: String): String {
+        if (slugRegex.matches(slug)) return slug
+        var normalized = slug.lowercase()
+        // Swift replaces each invalid char with a single "-" (no global collapse
+        // in the first pass), then collapses runs — replicate exactly so the
+        // result is byte-identical.
+        normalized = normalized.replace(Regex("[^a-z0-9-]"), "-")
+        normalized = normalized.replace(Regex("-{2,}"), "-")
+        normalized = normalized.trim('-')
+        android.util.Log.w(
+            ConsoleLogger.TAG,
+            "Metric slug \"$slug\" was auto-corrected to \"$normalized\". " +
+                "Slugs should contain only lowercase letters, numbers, and hyphens.",
+        )
+        return normalized
+    }
+
     // MARK: - Logging internals
 
     /** Fallback source-location defaults — Kotlin has no `#file`/`#function` literal. */
