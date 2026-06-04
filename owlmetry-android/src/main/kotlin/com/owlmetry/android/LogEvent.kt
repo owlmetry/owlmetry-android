@@ -73,6 +73,81 @@ public data class LogEvent(
 
     /** Convenience: the serialized JSON as a String. */
     public fun toJsonString(): String = toJson().toString()
+
+    public companion object {
+        /**
+         * Parse a [LogEvent] back from a [JSONObject] produced by [toJson]. This
+         * is the inverse used by the [OfflineQueue] to round-trip events through
+         * disk, mirroring Swift's `Codable` decode of `[LogEvent]` from the
+         * persisted offline file.
+         *
+         * Required fields (`client_event_id`, `session_id`, `level`, `message`,
+         * `environment`, `is_dev`, `timestamp`) throw [org.json.JSONException]
+         * when missing; optional fields default to null when absent — matching
+         * the omit-when-null encoding in [toJson]. Unknown `level`/`environment`
+         * wire strings fall back to [OwlLogLevel.INFO] / [OwlPlatform.ANDROID]
+         * rather than crashing a flush over a forward-compat value.
+         */
+        public fun fromJson(obj: JSONObject): LogEvent {
+            return LogEvent(
+                clientEventId = obj.getString("client_event_id"),
+                sessionId = obj.getString("session_id"),
+                userId = obj.optStringOrNull("user_id"),
+                level = levelFromWire(obj.getString("level")),
+                sourceModule = obj.optStringOrNull("source_module"),
+                message = obj.getString("message"),
+                screenName = obj.optStringOrNull("screen_name"),
+                customAttributes = obj.optJSONObject("custom_attributes")?.let { stringMap(it) },
+                environment = platformFromWire(obj.getString("environment")),
+                osVersion = obj.optStringOrNull("os_version"),
+                appVersion = obj.optStringOrNull("app_version"),
+                sdkName = obj.optStringOrNull("sdk_name"),
+                sdkVersion = obj.optStringOrNull("sdk_version"),
+                buildNumber = obj.optStringOrNull("build_number"),
+                deviceModel = obj.optStringOrNull("device_model"),
+                locale = obj.optStringOrNull("locale"),
+                preferredLanguage = obj.optStringOrNull("preferred_language"),
+                supportedLanguages = obj.optJSONArray("supported_languages")?.let { stringList(it) },
+                isDev = obj.getBoolean("is_dev"),
+                timestamp = obj.getString("timestamp"),
+            )
+        }
+
+        /** Parse a JSON array of event objects. Used to reload the offline queue. */
+        public fun listFromJson(arr: JSONArray): List<LogEvent> {
+            val out = ArrayList<LogEvent>(arr.length())
+            for (i in 0 until arr.length()) {
+                out.add(fromJson(arr.getJSONObject(i)))
+            }
+            return out
+        }
+
+        private fun levelFromWire(wire: String): OwlLogLevel =
+            OwlLogLevel.entries.firstOrNull { it.wire == wire } ?: OwlLogLevel.INFO
+
+        private fun platformFromWire(wire: String): OwlPlatform =
+            OwlPlatform.entries.firstOrNull { it.wire == wire } ?: OwlPlatform.ANDROID
+
+        private fun stringMap(obj: JSONObject): Map<String, String> {
+            val out = LinkedHashMap<String, String>()
+            val keys = obj.keys()
+            while (keys.hasNext()) {
+                val key = keys.next()
+                out[key] = obj.getString(key)
+            }
+            return out
+        }
+
+        private fun stringList(arr: JSONArray): List<String> {
+            val out = ArrayList<String>(arr.length())
+            for (i in 0 until arr.length()) out.add(arr.getString(i))
+            return out
+        }
+
+        /** `optString` returns "" for a missing key; we want a true null. */
+        private fun JSONObject.optStringOrNull(key: String): String? =
+            if (has(key) && !isNull(key)) getString(key) else null
+    }
 }
 
 /**

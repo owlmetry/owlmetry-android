@@ -2,6 +2,11 @@ package com.owlmetry.android
 
 import android.content.Context
 import android.content.pm.ApplicationInfo
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import java.util.UUID
 
 /**
@@ -24,6 +29,15 @@ public object Owl {
     private val lock = Any()
 
     private var state: State? = null
+
+    /**
+     * SDK-wide coroutine scope — the analog of the structured-concurrency root
+     * the Swift actors live under. The flush loop, auto-flush Tasks, offline
+     * debounce, and identity claim all run here. A [SupervisorJob] keeps one
+     * failing child from tearing the scope down. Recreated each [configure];
+     * cancelled on [resetForTesting].
+     */
+    private var sdkScope: CoroutineScope? = null
 
     // Pre-configure identity ops, applied at the next configure(). iOS persists
     // setUser/clearUser immediately (Keychain/UserDefaults are globally
@@ -54,7 +68,19 @@ public object Owl {
         // The resolved id stamped onto events: the real user id once set,
         // otherwise the anonymous id. Mirrors Swift's `defaultUserId`.
         var defaultUserId: String,
+        // The batching/retrying event transport. Its flush loop is started at
+        // configure() and it owns the offline queue + network monitor.
+        val transport: EventTransport,
+        // The live reachability monitor, held so it can be torn down on reset.
+        val networkMonitor: NetworkMonitor,
     )
+
+    /**
+     * The active [EventTransport] once configured, else null. Internal — later
+     * phases (logging, metrics, claim, properties) enqueue through it.
+     */
+    internal val transport: EventTransport?
+        get() = synchronized(lock) { state?.transport }
 
     /** The active session id, or null before [configure]. */
     public val sessionId: String?
@@ -76,11 +102,11 @@ public object Owl {
      * [OwlConfigurationError] on invalid endpoint / API key / missing bundle id
      * (mirrors Swift's throwing `configure`).
      *
-     * TODO(Phase 4): start the EventTransport flush loop here, and — when a
-     * previously saved real user id differs from the anonymous id — fire the
-     * idempotent startup identity *claim* against the server (Swift's
-     * `transport.claimIdentity` reclaim in `configureWith`). The persisted ids
-     * this reads are already in place.
+     * Starts the [EventTransport] flush loop and — when a previously saved real
+     * user id differs from the anonymous id — fires the idempotent startup
+     * identity *claim* against the server (Swift's `transport.claimIdentity`
+     * reclaim in `configureWith`), retroactively attributing anonymous events
+     * sent before this user was known.
      */
     @Throws(OwlConfigurationError::class)
     public fun configure(
@@ -109,7 +135,26 @@ public object Owl {
 
         val identityStore = IdentityStore(appContext)
 
+        // Build the SDK's coroutine scope + transport plumbing. Done outside the
+        // lock (it touches the framework + filesystem) then published under it.
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val networkMonitor = NetworkMonitor.create(appContext)
+        val offlineQueue = OfflineQueue(directory = appContext.filesDir, scope = scope)
+        val transport = EventTransport(
+            endpoint = configuration.endpoint.toURL(),
+            apiKey = configuration.apiKey,
+            bundleId = configuration.bundleId,
+            compressionEnabled = configuration.compressionEnabled,
+            offlineQueue = offlineQueue,
+            networkMonitor = networkMonitor,
+            scope = scope,
+        )
+
+        var claimAnon: String? = null
+        var claimUser: String? = null
+
         synchronized(lock) {
+            sdkScope = scope
             // Apply any identity op issued before configure() so it persists and
             // resolves into this session, mirroring Swift's unconditional
             // IdentityManager persistence (only the server claim is gated on
@@ -127,7 +172,17 @@ public object Owl {
             // Resolve identity: saved real user id > persistent anonymous id —
             // byte-for-byte the Swift `configureWith` resolution.
             val anonId = identityStore.anonymousId()
-            val resolvedUserId = identityStore.savedUserId() ?: anonId
+            val savedUserId = identityStore.savedUserId()
+            val resolvedUserId = savedUserId ?: anonId
+
+            // Startup reclaim: if a real user id is on file and differs from the
+            // anon id, claim it so anonymous events sent on a prior launch (or
+            // before this user logged in) attribute to the real user. Fired
+            // after the lock is released. Mirrors Swift's `configureWith`.
+            if (savedUserId != null && savedUserId != anonId) {
+                claimAnon = anonId
+                claimUser = savedUserId
+            }
 
             state = State(
                 configuration = configuration,
@@ -137,7 +192,19 @@ public object Owl {
                 identityStore = identityStore,
                 anonymousId = anonId,
                 defaultUserId = resolvedUserId,
+                transport = transport,
+                networkMonitor = networkMonitor,
             )
+        }
+
+        // Start the flush loop and fire the optional startup claim outside the
+        // lock — claimIdentity suspends (flushAll + drain in-flight sends) and
+        // must not hold the monitor lock.
+        transport.start()
+        val anon = claimAnon
+        val user = claimUser
+        if (anon != null && user != null) {
+            scope.launch { transport.claimIdentity(anonymousId = anon, userId = user) }
         }
     }
 
@@ -153,13 +220,19 @@ public object Owl {
      * where `IdentityManager.saveUserId` runs even pre-configure and only the
      * server *claim* is gated on transport.
      *
-     * TODO(Phase 4): after persisting (when configured), await any in-flight log
-     * tasks then fire `transport.claimIdentity(anonymousId, identifier)` so
-     * previously-sent anonymous events are retroactively associated with this
-     * user (Swift's claim path). The identity *state* update is complete here.
+     * When configured, after persisting it fires
+     * `transport.claimIdentity(anonymousId, identifier)` so previously-sent
+     * anonymous events are retroactively associated with this user (Swift's
+     * claim path).
+     *
+     * Residual divergence vs Swift: Swift first awaits any in-flight
+     * `Owl.log(...)` Tasks (`awaitInFlightLogTasks`) so the claim's `flushAll`
+     * can't race ahead of events still being built. The logging API lands in a
+     * later phase, so there are no in-flight log tasks to await yet; the barrier
+     * is added there alongside `log`.
      */
     public fun setUser(identifier: String) {
-        synchronized(lock) {
+        val (transport, anonId) = synchronized(lock) {
             val s = state
             if (s == null) {
                 // Pre-configure: stash so the next configure() persists +
@@ -171,7 +244,11 @@ public object Owl {
             }
             s.identityStore.saveUserId(identifier)
             s.defaultUserId = identifier
+            s.transport to s.anonymousId
         }
+        // Fire the claim outside the lock — claimIdentity suspends (flushAll +
+        // in-flight-send drain). Mirrors Swift's `Task { ... claimIdentity }`.
+        sdkScope?.launch { transport.claimIdentity(anonymousId = anonId, userId = identifier) }
     }
 
     /**
@@ -218,6 +295,9 @@ public object Owl {
     /** Test/teardown hook — clears configured state + any stashed identity ops. */
     internal fun resetForTesting() {
         synchronized(lock) {
+            state?.networkMonitor?.stop()
+            sdkScope?.cancel()
+            sdkScope = null
             state = null
             pendingUserId = null
             pendingClearUser = false

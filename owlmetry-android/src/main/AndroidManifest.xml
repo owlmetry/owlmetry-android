@@ -1,7 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- The SDK only needs network access to ship events to the ingest endpoint. -->
+    <!-- The SDK needs network access to ship events to the ingest endpoint. -->
     <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- NetworkMonitor classifies reachability (wifi/cellular/offline) via
+         ConnectivityManager to decide whether to send or queue offline. This is
+         a normal, install-time permission — merged into the host app silently,
+         no runtime prompt. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
 </manifest>
