@@ -440,4 +440,61 @@ class EventTransportDeepTest {
         val queue = OfflineQueue(dir, scope)
         assertTrue("no re-queue on a 2xx", queue.isEmpty())
     }
+
+    /**
+     * Crash safety: a single throwing flush tick must NOT kill the periodic flush
+     * loop. The loop body guards each `flush()` (rethrowing CancellationException)
+     * so one bad tick logs and the loop keeps running for subsequent events —
+     * without this, the throw would unwind the `while` loop and stop ALL future
+     * periodic flushing for the process lifetime (and reach the scope's
+     * exception handler). Here the first tick throws (reachability read fails),
+     * and a later event is still delivered on a subsequent tick.
+     */
+    @Test
+    fun `a throwing flush tick does not kill the periodic flush loop`() = runTest {
+        val http = FakeHttpClient()
+        // isConnected throws on its first read (during the first flush tick that
+        // has a buffered event), then behaves. flush() reads isConnected after
+        // pulling the batch, so the first tick throws out of flush().
+        val flaky = object : Reachability {
+            @Volatile
+            var calls = 0
+            override val isConnected: Boolean
+                get() {
+                    calls += 1
+                    if (calls == 1) throw IllegalStateException("transient reachability failure")
+                    return true
+                }
+        }
+        val tx = transport(http, flaky, scope = backgroundScope, ioDispatcher = StandardTestDispatcher(testScheduler))
+
+        tx.enqueue(event("lost-on-throwing-tick"))
+        tx.start()
+
+        // Tick 1: the buffered event is pulled, then isConnected throws → the
+        // per-tick guard swallows it and the loop survives (this event is lost,
+        // which is acceptable — losing one batch is never a crash).
+        advanceTimeBy(5_001)
+        runCurrent()
+
+        // A new event arrives after the throwing tick.
+        tx.enqueue(event("delivered-after-recovery"))
+
+        // Tick 2: isConnected now succeeds → the loop is still alive and delivers.
+        advanceTimeBy(5_001)
+        runCurrent()
+
+        // Stop the loop so the test can settle (don't advanceUntilIdle a live
+        // infinite-delay loop).
+        tx.shutdown()
+        runCurrent()
+
+        assertTrue("isConnected was read on both ticks", flaky.calls >= 2)
+        assertEquals("loop survived the throwing tick and flushed a later event", 1, http.ingest().size)
+        val body = JSONObject(String(http.ingest().first().body!!, Charsets.UTF_8))
+        assertEquals(
+            "delivered-after-recovery",
+            body.getJSONArray("events").getJSONObject(0).getString("client_event_id"),
+        )
+    }
 }

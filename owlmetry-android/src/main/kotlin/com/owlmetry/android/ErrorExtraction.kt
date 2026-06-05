@@ -47,23 +47,34 @@ internal object ErrorExtraction {
     fun extract(error: Throwable, userMessage: String?): Result {
         val attrs = LinkedHashMap<String, String>()
 
-        attrs["_error_type"] = error.javaClass.name
+        // Every read below dereferences an OVERRIDABLE member of a caller-supplied
+        // Throwable (message / localizedMessage / toString / cause / printStackTrace).
+        // A hostile or buggy custom exception class can throw from any of them, and
+        // this runs synchronously inside Owl.error(Throwable) on the caller's
+        // thread — so each access is wrapped to keep extract() total. The SDK must
+        // never crash the host through its own error-reporting path.
+        attrs["_error_type"] = runCatching { error.javaClass.name }.getOrDefault("UnknownError")
 
-        val stack = stackTraceString(error)
+        val stack = runCatching { stackTraceString(error) }.getOrDefault("")
         if (stack.isNotEmpty()) {
             attrs["_error_stack"] =
                 if (stack.length > MAX_STACK_LENGTH) stack.substring(0, MAX_STACK_LENGTH) else stack
         }
 
         // Walk the cause chain (Throwable.cause ≈ NSUnderlyingErrorKey), guarding
-        // against a self-referential or cyclic chain so we can't loop forever.
-        var current: Throwable? = error.cause
+        // against a self-referential or cyclic chain so we can't loop forever, and
+        // against a custom Throwable whose cause/message accessors throw.
+        var current: Throwable? = runCatching { error.cause }.getOrNull()
         var depth = 1
-        while (current != null && depth <= MAX_CAUSE_DEPTH && current !== error) {
-            attrs["_error_cause_${depth}_type"] = current.javaClass.name
-            attrs["_error_cause_${depth}_message"] = current.localizedMessage ?: current.toString()
-            val next = current.cause
-            if (next === current) break // direct self-cause
+        while (depth <= MAX_CAUSE_DEPTH) {
+            val cause = current ?: break
+            if (cause === error) break // cycle back to the root
+            attrs["_error_cause_${depth}_type"] =
+                runCatching { cause.javaClass.name }.getOrDefault("UnknownError")
+            attrs["_error_cause_${depth}_message"] =
+                runCatching { cause.localizedMessage ?: cause.toString() }.getOrDefault("")
+            val next = runCatching { cause.cause }.getOrNull()
+            if (next === cause) break // direct self-cause
             current = next
             depth += 1
         }
@@ -85,14 +96,21 @@ internal object ErrorExtraction {
     private fun resolveMessage(error: Throwable, userMessage: String?): String {
         val user = userMessage?.trim()
         if (!user.isNullOrEmpty()) return user
-        val localized = error.localizedMessage?.trim()
+        // localizedMessage / toString are overridable and can throw on a custom
+        // Throwable — fall through to the (final, safe) class name so the event
+        // message is never empty and extraction never throws.
+        val localized = runCatching { error.localizedMessage?.trim() }.getOrNull()
         if (!localized.isNullOrEmpty()) return localized
-        return error.toString()
+        return runCatching { error.toString() }.getOrNull()?.ifEmpty { null }
+            ?: runCatching { error.javaClass.name }.getOrDefault("Error")
     }
 
     private fun stackTraceString(error: Throwable): String {
         val sw = StringWriter()
-        PrintWriter(sw).use { error.printStackTrace(it) }
+        // printStackTrace walks getStackTrace()/getCause(), both overridable and
+        // capable of throwing on a hostile Throwable — guard so a partial/failed
+        // trace degrades to whatever was written rather than escaping.
+        runCatching { PrintWriter(sw).use { error.printStackTrace(it) } }
         return sw.toString().trimEnd()
     }
 }

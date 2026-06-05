@@ -96,7 +96,19 @@ internal class EventTransport(
         flushJob = scope.launch {
             while (isActive) {
                 delay(FLUSH_INTERVAL_MS)
-                flush()
+                // Guard each tick so one bad flush logs and the loop keeps running
+                // for subsequent events. Without this a single throw would unwind
+                // the loop (and reach the scope's exception handler) — silencing
+                // the crash but also stopping ALL future periodic flushing for the
+                // process lifetime. Rethrow CancellationException so shutdown() and
+                // scope cancellation still tear the loop down cleanly.
+                try {
+                    flush()
+                } catch (cancellation: kotlinx.coroutines.CancellationException) {
+                    throw cancellation
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Periodic flush failed; will retry next interval.", t)
+                }
             }
         }
     }

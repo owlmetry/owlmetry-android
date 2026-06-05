@@ -76,14 +76,25 @@ public fun OwlQuestionnaireGate(
     // Evaluation closure shared by the first-composition pass and the
     // foreground observer. Mirrors Swift's `evaluate(force:)`.
     suspend fun evaluate() {
-        if (!forceShow) {
-            if (presented) return
-            if (Owl.questionnaireWasShownThisProcess(slug)) return
-            if (trigger.isManual) return
-            val snapshot = OwlQuestionnaireState.shared?.snapshot() ?: return
-            if (!trigger.isSatisfied(snapshot)) return
-            if (isEligible != null && !isEligible()) return
-        }
+        // Fail CLOSED on any error in the local gate. Two things here can throw and
+        // would otherwise escape into the LaunchedEffect / ON_RESUME launch — which
+        // carry NO CoroutineExceptionHandler — and crash the host process: the
+        // consumer-supplied `isEligible` lambda, and the SharedPreferences read
+        // inside `snapshot()` (getInt/getLong throw ClassCastException if a key is
+        // ever persisted as the wrong type / the prefs file is corrupt). On any
+        // throw we simply don't present the questionnaire.
+        val passesLocalGate = runCatching {
+            if (forceShow) return@runCatching true
+            if (presented) return@runCatching false
+            if (Owl.questionnaireWasShownThisProcess(slug)) return@runCatching false
+            if (trigger.isManual) return@runCatching false
+            val snapshot = OwlQuestionnaireState.shared?.snapshot() ?: return@runCatching false
+            if (!trigger.isSatisfied(snapshot)) return@runCatching false
+            if (isEligible != null && !isEligible()) return@runCatching false
+            true
+        }.getOrDefault(false)
+        if (!passesLocalGate) return
+
         val result = runCatching { Owl.fetchQuestionnaire(slug = slug, force = forceShow) }.getOrNull() ?: return
         val questionnaire = result.questionnaire ?: return
         if (!forceShow) {

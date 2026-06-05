@@ -178,4 +178,50 @@ class ErrorExtractionTest {
         assertEquals(5, ErrorExtraction.MAX_CAUSE_DEPTH)
         assertEquals(16000, ErrorExtraction.MAX_STACK_LENGTH)
     }
+
+    // --- Crash safety: a hostile/buggy host Throwable must never escape ---------
+    //
+    // Owl.error(Throwable) runs ErrorExtraction.extract SYNCHRONOUSLY on the
+    // caller's thread. A host can pass a custom exception whose overridable
+    // accessors throw; extract() must degrade gracefully, never propagate. An
+    // analytics SDK can never be the thing that crashes its host through its own
+    // error-reporting path.
+
+    /** A Throwable whose every overridable accessor throws — the worst case. */
+    private class HostileThrowable :
+        RuntimeException() {
+        override val message: String get() = throw IllegalStateException("message accessor blew up")
+        override val cause: Throwable get() = throw IllegalStateException("cause accessor blew up")
+        override fun toString(): String = throw IllegalStateException("toString blew up")
+        override fun printStackTrace(s: java.io.PrintWriter) {
+            throw IllegalStateException("printStackTrace blew up")
+        }
+    }
+
+    @Test
+    fun hostileThrowableNeverEscapesExtraction() {
+        // Must not throw — the type comes from the final javaClass.name (safe),
+        // and the message falls back to the class name when every accessor throws.
+        val result = ErrorExtraction.extract(error = HostileThrowable(), userMessage = null)
+        assertTrue(result.attributes["_error_type"]!!.contains("HostileThrowable"))
+        assertFalse("a message is always produced", result.message.isEmpty())
+        // The stack is best-effort: a throwing printStackTrace degrades to empty,
+        // it never propagates.
+        assertTrue(
+            "stack is empty-or-present, never a thrown error",
+            result.attributes["_error_stack"] == null || result.attributes["_error_stack"]!!.isNotEmpty(),
+        )
+    }
+
+    @Test
+    fun hostileThrowableAsCauseDoesNotEscape() {
+        // A well-behaved outer error with a hostile cause: the cause's type still
+        // resolves (javaClass.name is safe) and its message degrades to "" rather
+        // than throwing out of the cause walk.
+        val outer = RuntimeException("outer", HostileThrowable())
+        val result = ErrorExtraction.extract(error = outer, userMessage = "while syncing")
+        assertEquals("while syncing", result.message)
+        assertTrue(result.attributes["_error_cause_1_type"]!!.contains("HostileThrowable"))
+        assertEquals("", result.attributes["_error_cause_1_message"])
+    }
 }

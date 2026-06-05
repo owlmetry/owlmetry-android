@@ -3,6 +3,7 @@ package com.owlmetry.android
 import android.content.Context
 import android.content.pm.ApplicationInfo
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -41,9 +42,15 @@ public object Owl {
     /**
      * SDK-wide coroutine scope — the analog of the structured-concurrency root
      * the Swift actors live under. The flush loop, auto-flush Tasks, offline
-     * debounce, and identity claim all run here. A [SupervisorJob] keeps one
-     * failing child from tearing the scope down. Recreated each [configure];
-     * cancelled on [resetForTesting].
+     * debounce, identity claim, attachment uploads, and lifecycle flush all run
+     * here. It carries a [CoroutineExceptionHandler] (installed in [configure])
+     * that swallows + logs any uncaught throw, so a failing background task can
+     * never crash the host app — this is the SDK's crash-safety backstop. The
+     * [SupervisorJob] only isolates sibling coroutines from each other; it does
+     * NOT stop an uncaught exception from propagating to the JVM default
+     * uncaught-exception handler (which would kill the whole process), so the
+     * handler — not the SupervisorJob — is what guarantees crash safety.
+     * Recreated each [configure]; cancelled on [resetForTesting].
      */
     private var sdkScope: CoroutineScope? = null
 
@@ -186,7 +193,26 @@ public object Owl {
 
         // Build the SDK's coroutine scope + transport plumbing. Done outside the
         // lock (it touches the framework + filesystem) then published under it.
-        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        //
+        // The CoroutineExceptionHandler is the SDK's crash-safety backstop: an
+        // analytics SDK must NEVER crash its host, but an uncaught throw in ANY
+        // `scope.launch {}` (the flush loop, auto-flush, identity claim,
+        // attachment upload, lifecycle flush) would otherwise reach the JVM
+        // default uncaught-exception handler and kill the whole process — a
+        // background-thread crash is just as fatal as a main-thread one.
+        // SupervisorJob does NOT prevent this; it only isolates sibling
+        // coroutines. The handler swallows + logs, so a failed background task
+        // drops telemetry instead of taking the app down. (Individual bodies
+        // still catch where they must keep running, e.g. the flush loop — this
+        // is the last line of defense, not the only one.)
+        val crashSafetyHandler = CoroutineExceptionHandler { _, throwable ->
+            android.util.Log.e(
+                ConsoleLogger.TAG,
+                "Owlmetry background task failed; event(s) may be dropped (host app unaffected).",
+                throwable,
+            )
+        }
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default + crashSafetyHandler)
         val networkMonitor = NetworkMonitor.create(appContext)
         val offlineQueue = OfflineQueue(directory = appContext.filesDir, scope = scope)
         val transport = EventTransport(
@@ -212,7 +238,11 @@ public object Owl {
         // the state is published (it touches the main-thread lifecycle owner).
         val lifecycleObserver: LifecycleObserver? =
             if (configuration.flushOnBackground) {
-                LifecycleObserver(transport = transport, scope = scope)
+                // The observer's default lifecycleOwner is ProcessLifecycleOwner.get(),
+                // evaluated here on the caller's thread — it throws if the host stripped
+                // androidx.startup's ProcessLifecycleInitializer from its manifest.
+                // Degrade to no background-flush observer rather than crash configure().
+                runCatching { LifecycleObserver(transport = transport, scope = scope) }.getOrNull()
             } else {
                 null
             }
@@ -284,8 +314,18 @@ public object Owl {
         // Register the background-flush observer with the process lifecycle.
         // Done after publishing state so the first ON_START it may immediately
         // receive (if the app is already foregrounded) sees a configured SDK.
-        // Mirrors Swift's `lifecycleObserver?.start()`.
-        lifecycleObserver?.start()
+        // Mirrors Swift's `lifecycleObserver?.start()`. `addObserver` asserts the
+        // main thread, so if the host called configure() off-main (or the
+        // lifecycle owner is unusable) degrade to "no background flush" instead
+        // of crashing the host.
+        runCatching { lifecycleObserver?.start() }
+            .onFailure {
+                android.util.Log.w(
+                    ConsoleLogger.TAG,
+                    "Background-flush lifecycle observer could not start; background flush disabled.",
+                    it,
+                )
+            }
 
         // Bump the launch counter (idempotent per process) + record the install
         // timestamp on first launch. Backs the questionnaire trigger conditions.

@@ -42,7 +42,14 @@ internal class OfflineQueue(
     private val maxEvents = 10_000
 
     init {
-        val dir = File(directory, "owlmetry").apply { mkdirs() }
+        val dir = File(directory, "owlmetry")
+        // mkdirs() can throw SecurityException under a restrictive SecurityManager
+        // (it returns false for ordinary failures like disk-full). This runs
+        // synchronously on the caller's thread inside Owl.configure(), so a failed
+        // or forbidden mkdir must degrade to a no-op queue — writeToDisk() and
+        // loadFromDisk() are themselves runCatching-guarded — rather than crash
+        // configure().
+        runCatching { dir.mkdirs() }
         file = File(dir, "offline_queue.json")
         events.addAll(loadFromDisk())
     }
