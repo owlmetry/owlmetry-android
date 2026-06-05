@@ -1,6 +1,7 @@
 package com.owlmetry.android
 
 import android.util.Log
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -104,7 +105,7 @@ internal class EventTransport(
                 // scope cancellation still tear the loop down cleanly.
                 try {
                     flush()
-                } catch (cancellation: kotlinx.coroutines.CancellationException) {
+                } catch (cancellation: CancellationException) {
                     throw cancellation
                 } catch (t: Throwable) {
                     Log.w(TAG, "Periodic flush failed; will retry next interval.", t)

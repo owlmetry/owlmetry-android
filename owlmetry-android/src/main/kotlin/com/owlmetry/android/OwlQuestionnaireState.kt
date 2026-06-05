@@ -47,12 +47,18 @@ public class OwlQuestionnaireState internal constructor(
             if (didMarkConfigured) return
             didMarkConfigured = true
 
-            val next = prefs.getInt(KEY_LAUNCH_COUNT, 0) + 1
-            val editor = prefs.edit().putInt(KEY_LAUNCH_COUNT, next)
-            if (!prefs.contains(KEY_FIRST_LAUNCH_AT)) {
-                editor.putLong(KEY_FIRST_LAUNCH_AT, now)
+            // SharedPreferences typed reads throw ClassCastException on a corrupt /
+            // type-mismatched key, and this runs synchronously in Owl.configure() on
+            // the caller's thread — degrade to "don't bump the counter this run"
+            // rather than crash the host.
+            runCatching {
+                val next = prefs.getInt(KEY_LAUNCH_COUNT, 0) + 1
+                val editor = prefs.edit().putInt(KEY_LAUNCH_COUNT, next)
+                if (!prefs.contains(KEY_FIRST_LAUNCH_AT)) {
+                    editor.putLong(KEY_FIRST_LAUNCH_AT, now)
+                }
+                editor.apply()
             }
-            editor.apply()
         }
     }
 
@@ -64,18 +70,25 @@ public class OwlQuestionnaireState internal constructor(
      */
     public fun incrementForeground() {
         synchronized(lock) {
-            val next = prefs.getInt(KEY_FOREGROUND_COUNT, 0) + 1
-            prefs.edit().putInt(KEY_FOREGROUND_COUNT, next).apply()
+            // getInt throws ClassCastException on a type-mismatched key; this runs
+            // on the main thread from the lifecycle observer — never crash the host.
+            runCatching {
+                val next = prefs.getInt(KEY_FOREGROUND_COUNT, 0) + 1
+                prefs.edit().putInt(KEY_FOREGROUND_COUNT, next).apply()
+            }
         }
     }
 
     /** Total `Owl.configure(...)` completions since install. */
     public val launchCount: Int
-        get() = prefs.getInt(KEY_LAUNCH_COUNT, 0)
+        // getInt throws ClassCastException on a corrupt/type-mismatched key; this is
+        // public API (Owl.launchCount) a host may read anytime, so degrade to 0
+        // rather than crash. Mirrors the totality of every other read here.
+        get() = runCatching { prefs.getInt(KEY_LAUNCH_COUNT, 0) }.getOrDefault(0)
 
     /** Total foreground transitions since install. */
     public val foregroundCount: Int
-        get() = prefs.getInt(KEY_FOREGROUND_COUNT, 0)
+        get() = runCatching { prefs.getInt(KEY_FOREGROUND_COUNT, 0) }.getOrDefault(0)
 
     /**
      * Epoch-millis timestamp of the first-ever `Owl.configure(...)` on this
@@ -83,12 +96,12 @@ public class OwlQuestionnaireState internal constructor(
      * analog is epoch millis (the [Snapshot] derivations work in either unit).
      */
     public val firstLaunchAt: Long?
-        get() {
+        get() = runCatching {
             // `contains` is the authoritative presence check — epoch 0 is a valid
-            // (if unrealistic) timestamp, so don't treat 0 as "absent".
-            if (!prefs.contains(KEY_FIRST_LAUNCH_AT)) return null
-            return prefs.getLong(KEY_FIRST_LAUNCH_AT, 0L)
-        }
+            // (if unrealistic) timestamp, so don't treat 0 as "absent". getLong
+            // throws ClassCastException on a type-mismatched key — degrade to null.
+            if (!prefs.contains(KEY_FIRST_LAUNCH_AT)) null else prefs.getLong(KEY_FIRST_LAUNCH_AT, 0L)
+        }.getOrNull()
 
     /**
      * Immutable snapshot for pure condition evaluation. Used by the trigger gate

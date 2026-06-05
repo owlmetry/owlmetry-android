@@ -47,13 +47,15 @@ internal object ErrorExtraction {
     fun extract(error: Throwable, userMessage: String?): Result {
         val attrs = LinkedHashMap<String, String>()
 
-        // Every read below dereferences an OVERRIDABLE member of a caller-supplied
-        // Throwable (message / localizedMessage / toString / cause / printStackTrace).
-        // A hostile or buggy custom exception class can throw from any of them, and
-        // this runs synchronously inside Owl.error(Throwable) on the caller's
-        // thread — so each access is wrapped to keep extract() total. The SDK must
-        // never crash the host through its own error-reporting path.
-        attrs["_error_type"] = runCatching { error.javaClass.name }.getOrDefault("UnknownError")
+        // The OVERRIDABLE members of a caller-supplied Throwable (message /
+        // localizedMessage / toString / cause / printStackTrace) can throw from a
+        // hostile or buggy custom exception class, and this runs synchronously
+        // inside Owl.error(Throwable) on the caller's thread — so each of those is
+        // wrapped to keep extract() total. `javaClass.name` is a final intrinsic
+        // (Object.getClass + Class.getName) that cannot be overridden or throw, so
+        // it stays unwrapped and is the always-safe fallback. The SDK must never
+        // crash the host through its own error-reporting path.
+        attrs["_error_type"] = error.javaClass.name
 
         val stack = runCatching { stackTraceString(error) }.getOrDefault("")
         if (stack.isNotEmpty()) {
@@ -69,8 +71,7 @@ internal object ErrorExtraction {
         while (depth <= MAX_CAUSE_DEPTH) {
             val cause = current ?: break
             if (cause === error) break // cycle back to the root
-            attrs["_error_cause_${depth}_type"] =
-                runCatching { cause.javaClass.name }.getOrDefault("UnknownError")
+            attrs["_error_cause_${depth}_type"] = cause.javaClass.name
             attrs["_error_cause_${depth}_message"] =
                 runCatching { cause.localizedMessage ?: cause.toString() }.getOrDefault("")
             val next = runCatching { cause.cause }.getOrNull()
@@ -102,7 +103,7 @@ internal object ErrorExtraction {
         val localized = runCatching { error.localizedMessage?.trim() }.getOrNull()
         if (!localized.isNullOrEmpty()) return localized
         return runCatching { error.toString() }.getOrNull()?.ifEmpty { null }
-            ?: runCatching { error.javaClass.name }.getOrDefault("Error")
+            ?: error.javaClass.name
     }
 
     private fun stackTraceString(error: Throwable): String {
